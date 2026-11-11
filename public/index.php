@@ -3,6 +3,8 @@
  * public/index.php — Halaman booking pelanggan ala Cal.com
  * - Multi-step / Split layout (Profile & Info | Calendar | Slots | Booking Form Modal/Step)
  * - Cal.com look & feel (Clean minimalist, modern typography, crisp borders, slick time picker)
+ * - Sign in with Google (Client OAuth via redirect ke Google)
+ * - Fallback / Mode Tamu (Pengisian manual, Google Calendar otomatis kirim RSVP email undangan 'sendUpdates=all')
  * - Full backward-compatible backend integration (POST create, AJAX ?ajax=slots)
  */
 declare(strict_types=1);
@@ -12,7 +14,7 @@ require __DIR__ . '/../src/Db.php';
 require __DIR__ . '/../src/Booking.php';
 require __DIR__ . '/../src/Calendar.php';
 
-use App\{Db, Booking};
+use App\{Db, Booking, Calendar};
 
 session_start();
 if (empty($_SESSION['booking_csrf'])) {
@@ -58,7 +60,24 @@ $available = [];
 $confirmation = $_SESSION['booking_confirmation'] ?? null;
 unset($_SESSION['booking_confirmation']);
 
+// Ambil data client login dari session jika ada
+$clientUser = $_SESSION['client_user'] ?? null;
+
+// Helper untuk URL redirect Google Client OAuth
+// Prioritas: GOOGLE_CLIENT_REDIRECT_URI di .env jika ada, jika tidak otomatis ke /index.php
+$clientRedirectUri = env('GOOGLE_CLIENT_REDIRECT_URI', '');
+if ($clientRedirectUri === '') {
+    $appUrl = rtrim((string)env('APP_URL', ''), '/');
+    if ($appUrl === '') {
+        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $host = $_SERVER['HTTP_HOST'] ?? '127.0.0.1:8080';
+        $appUrl = $scheme . '://' . $host;
+    }
+    $clientRedirectUri = $appUrl . '/index.php';
+}
+
 try {
+    // 1. AJAX slots endpoint
     if (isset($_GET['ajax']) && $_GET['ajax'] === 'slots') {
         $date = (string)($_GET['date'] ?? '');
         $serviceName = (string)($_GET['service'] ?? '');
@@ -67,6 +86,103 @@ try {
         exit;
     }
 
+    // 2. Action Logout Google Client
+    if (isset($_GET['action']) && $_GET['action'] === 'logout_google') {
+        unset($_SESSION['client_user']);
+        header('Location: index.php' . ($selectedDate ? '?date=' . urlencode($selectedDate) : ''));
+        exit;
+    }
+
+    // 3. Action Login Google (Redirect ke Google OAuth)
+    if (isset($_GET['action']) && $_GET['action'] === 'login_google') {
+        $clientId = env('GOOGLE_CLIENT_ID', '');
+        if (!$clientId) {
+            throw new RuntimeException('GOOGLE_CLIENT_ID belum dikonfigurasi di .env.');
+        }
+        $state = bin2hex(random_bytes(16));
+        $_SESSION['client_oauth_state'] = $state;
+        // Simpan context pilihan saat ini agar setelah kembali tetap di slot yang dipilih
+        $_SESSION['client_oauth_context'] = [
+            'service' => (string)($_GET['service'] ?? $selectedServiceName),
+            'date' => (string)($_GET['date'] ?? $selectedDate),
+            'time' => (string)($_GET['time'] ?? ''),
+        ];
+
+        $params = [
+            'client_id' => $clientId,
+            'redirect_uri' => $clientRedirectUri,
+            'response_type' => 'code',
+            'scope' => 'openid email profile',
+            'state' => $state,
+            'prompt' => 'select_account',
+        ];
+        header('Location: https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query($params));
+        exit;
+    }
+
+    // 4. Callback OAuth dari Google Client
+    if (isset($_GET['code']) && isset($_GET['state'])) {
+        $state = (string)$_GET['state'];
+        $savedState = (string)($_SESSION['client_oauth_state'] ?? '');
+        unset($_SESSION['client_oauth_state']);
+
+        if (!$savedState || !hash_equals($savedState, $state)) {
+            throw new RuntimeException('Sesi otorisasi Google tidak valid atau telah kedaluwarsa.');
+        }
+
+        $code = (string)$_GET['code'];
+        $clientId = env('GOOGLE_CLIENT_ID', '');
+        $clientSecret = env('GOOGLE_CLIENT_SECRET', '');
+
+        // Tukar kode dengan access token
+        $r = \App\httpRequest('POST', 'https://oauth2.googleapis.com/token', [
+            'Content-Type: application/x-www-form-urlencoded',
+        ], http_build_query([
+            'code' => $code,
+            'client_id' => $clientId,
+            'client_secret' => $clientSecret,
+            'redirect_uri' => $clientRedirectUri,
+            'grant_type' => 'authorization_code',
+        ]));
+
+        $tokenData = json_decode($r['body'], true) ?: [];
+        if ($r['status'] !== 200 || empty($tokenData['access_token'])) {
+            throw new RuntimeException('Gagal masuk dengan Google: ' . ($tokenData['error_description'] ?? 'Respon tidak valid'));
+        }
+
+        // Ambil profil user dari Google
+        $userRes = \App\httpRequest('GET', 'https://www.googleapis.com/oauth2/v3/userinfo', [
+            'Authorization: Bearer ' . $tokenData['access_token'],
+        ]);
+        $userData = json_decode($userRes['body'], true) ?: [];
+        if ($userRes['status'] !== 200 || empty($userData['email'])) {
+            throw new RuntimeException('Gagal mengambil profil akun Google.');
+        }
+
+        $_SESSION['client_user'] = [
+            'name' => (string)($userData['name'] ?? ''),
+            'email' => (string)$userData['email'],
+            'picture' => (string)($userData['picture'] ?? ''),
+        ];
+
+        // Pulihkan konteks booking jika ada
+        $ctx = $_SESSION['client_oauth_context'] ?? [];
+        unset($_SESSION['client_oauth_context']);
+        $redirectUrl = 'index.php?logged_in=1';
+        if (!empty($ctx['service'])) {
+            $redirectUrl .= '&service=' . urlencode($ctx['service']);
+        }
+        if (!empty($ctx['date'])) {
+            $redirectUrl .= '&date=' . urlencode($ctx['date']);
+        }
+        if (!empty($ctx['time'])) {
+            $redirectUrl .= '&time=' . urlencode($ctx['time']);
+        }
+        header('Location: ' . $redirectUrl);
+        exit;
+    }
+
+    // 5. Booking Form Submission (POST)
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!hash_equals($_SESSION['booking_csrf'], (string)($_POST['csrf'] ?? ''))) {
             throw new RuntimeException('Sesi tidak valid. Silakan muat ulang halaman.');
@@ -123,6 +239,7 @@ try {
             'time' => $booking['time'],
             'duration' => (int)$svc['duration'],
             'google_admin_link' => $booking['google_admin_link'] ?? '',
+            'is_google_user' => !empty($clientUser),
         ];
         header('Location: index.php?booked=1');
         exit;
@@ -132,7 +249,7 @@ try {
         $available = Booking::slots($selectedDate, (int)$currentService['id']);
     }
     if (isset($_GET['booked'])) {
-        $notice = 'Booking berhasil! Silakan periksa detail konfirmasi Anda.';
+        $notice = 'Booking berhasil! Undangan jadwal otomatis dikirim ke kalender Anda.';
     }
 } catch (Throwable $e) {
     if (isset($_GET['ajax'])) {
@@ -147,6 +264,28 @@ try {
 function h(mixed $v): string
 {
     return htmlspecialchars((string)$v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+// Generate web direct Add to Google Calendar link untuk konfirmasi
+function makeGoogleCalendarWebLink(array $c): string
+{
+    try {
+        $tz = new DateTimeZone(env('APP_TIMEZONE', 'Asia/Jakarta'));
+        $start = new DateTimeImmutable($c['date'] . ' ' . $c['time'], $tz);
+        $end = $start->modify('+' . (int)$c['duration'] . ' minutes');
+        $startUtc = $start->setTimezone(new DateTimeZone('UTC'))->format('Ymd\THis\Z');
+        $endUtc = $end->setTimezone(new DateTimeZone('UTC'))->format('Ymd\THis\Z');
+        
+        $params = [
+            'action' => 'TEMPLATE',
+            'text' => env('APP_NAME', 'Booking Appointment') . ' — ' . $c['service'],
+            'dates' => $startUtc . '/' . $endUtc,
+            'details' => 'Janji temu untuk ' . $c['name'] . ' (' . $c['service'] . '). Dibuat melalui sistem booking.',
+        ];
+        return 'https://calendar.google.com/calendar/render?' . http_build_query($params);
+    } catch (\Throwable $e) {
+        return '#';
+    }
 }
 ?>
 <!doctype html>
@@ -564,8 +703,133 @@ body {
   font-weight: 700;
   letter-spacing: -0.3px;
   color: var(--text-main);
+  margin-bottom: 16px;
+}
+
+/* Google Sign-In Bar (Cal.com style) */
+.google-auth-box {
   margin-bottom: 20px;
 }
+.btn-google-auth {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 11px 16px;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-md);
+  background: #ffffff;
+  color: var(--text-main);
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: all 0.15s ease;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+}
+.btn-google-auth:hover {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+}
+.btn-google-auth svg {
+  width: 18px;
+  height: 18px;
+}
+.logged-in-badge {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: var(--radius-md);
+  margin-bottom: 20px;
+}
+.user-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.user-avatar-img {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+}
+.user-avatar-initial {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #15803d;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 14px;
+}
+.user-meta-txt {
+  font-size: 13px;
+  color: #166534;
+  line-height: 1.3;
+}
+.user-meta-txt strong {
+  display: block;
+  font-size: 13.5px;
+  color: #14532d;
+}
+.btn-logout-client {
+  font-size: 12px;
+  color: #dc2626;
+  text-decoration: none;
+  font-weight: 600;
+}
+.btn-logout-client:hover {
+  text-decoration: underline;
+}
+
+.or-divider {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  margin: 18px 0;
+  color: var(--text-subtle);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.or-divider::before,
+.or-divider::after {
+  content: '';
+  flex: 1;
+  border-bottom: 1px solid var(--divider);
+}
+.or-divider:not(:empty)::before {
+  margin-right: .75em;
+}
+.or-divider:not(:empty)::after {
+  margin-left: .75em;
+}
+
+.notice-guest-rsvp {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  background: #f8fafc;
+  border: 1px solid var(--card-border);
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 16px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.notice-guest-rsvp svg {
+  width: 16px;
+  height: 16px;
+  color: #2563eb;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
 .cal-field {
   margin-bottom: 18px;
 }
@@ -651,7 +915,28 @@ body {
 .confirm-sub {
   font-size: 15px;
   color: var(--text-muted);
-  margin-bottom: 28px;
+  margin-bottom: 24px;
+}
+.confirm-rsvp-box {
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  color: #1e40af;
+  padding: 12px 16px;
+  border-radius: var(--radius-md);
+  font-size: 13.5px;
+  margin-bottom: 20px;
+  width: 100%;
+  text-align: left;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.confirm-rsvp-box svg {
+  width: 18px;
+  height: 18px;
+  color: #2563eb;
+  flex-shrink: 0;
+  margin-top: 2px;
 }
 .confirm-box {
   width: 100%;
@@ -676,32 +961,51 @@ body {
   color: var(--text-muted);
   flex-shrink: 0;
 }
-.confirm-link {
+.confirm-actions {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+  flex-wrap: wrap;
+}
+.btn-add-gcal {
+  flex: 1;
+  min-width: 200px;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  color: var(--accent);
+  justify-content: center;
+  gap: 8px;
+  background: #ffffff;
+  border: 1px solid var(--card-border);
+  color: var(--text-main);
+  padding: 11px 16px;
+  border-radius: var(--radius-md);
   font-weight: 600;
   font-size: 14px;
   text-decoration: none;
-  margin-top: 6px;
+  transition: all 0.15s;
 }
-.confirm-link:hover {
-  text-decoration: underline;
+.btn-add-gcal:hover {
+  background: var(--surface-hover);
+  border-color: #cbd5e1;
 }
 .btn-reset {
-  padding: 10px 20px;
+  flex: 1;
+  min-width: 160px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 11px 16px;
   border-radius: var(--radius-md);
-  border: 1px solid var(--card-border);
-  background: #ffffff;
-  color: var(--text-main);
+  border: 1px solid transparent;
+  background: var(--brand-black);
+  color: #ffffff;
   font-size: 14px;
   font-weight: 600;
   text-decoration: none;
   transition: all 0.15s;
 }
 .btn-reset:hover {
-  background: var(--surface-hover);
+  background: var(--brand-black-hover);
 }
 
 /* Footer note */
@@ -770,7 +1074,14 @@ body {
         <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
       </div>
       <h2 class="confirm-title">Jadwal Anda Telah Dikonfirmasi!</h2>
-      <p class="confirm-sub">Kami telah mengirimkan undangan ke <strong><?= h($confirmation['email']) ?></strong>.</p>
+      <p class="confirm-sub">Undangan kalender dan konfirmasi telah dikirimkan ke <strong><?= h($confirmation['email']) ?></strong>.</p>
+
+      <div class="confirm-rsvp-box">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+        <div>
+          <strong>Notifikasi Google Calendar:</strong> Email undangan kalender telah dikirim langsung dari Google Calendar. Buka email Anda dan klik <strong>Accept / Terima</strong> untuk mengonfirmasi kehadiran.
+        </div>
+      </div>
 
       <div class="confirm-box">
         <div class="confirm-row">
@@ -785,15 +1096,15 @@ body {
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
           <span><?= h($confirmation['date']) ?> · <strong><?= h($confirmation['time']) ?> WIB</strong></span>
         </div>
-        <?php if ($confirmation['google_admin_link']): ?>
-          <a class="confirm-link" href="<?= h($confirmation['google_admin_link']) ?>" target="_blank" rel="noopener">
-            Buka di Google Calendar
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
-          </a>
-        <?php endif; ?>
       </div>
 
-      <a href="index.php" class="btn-reset">Jadwalkan Sesi Lain</a>
+      <div class="confirm-actions">
+        <a href="<?= h(makeGoogleCalendarWebLink($confirmation)) ?>" target="_blank" rel="noopener" class="btn-add-gcal">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
+          Buka di Google Calendar
+        </a>
+        <a href="index.php" class="btn-reset">Jadwalkan Sesi Lain</a>
+      </div>
     </div>
 
   <?php else: ?>
@@ -890,20 +1201,55 @@ body {
 
         <h2 class="form-heading">Masukkan Detail Anda</h2>
 
+        <!-- Google Auth Section -->
+        <div class="google-auth-box">
+          <?php if (!empty($clientUser)): ?>
+            <div class="logged-in-badge">
+              <div class="user-identity">
+                <?php if (!empty($clientUser['picture'])): ?>
+                  <img class="user-avatar-img" src="<?= h($clientUser['picture']) ?>" alt="Avatar">
+                <?php else: ?>
+                  <div class="user-avatar-initial"><?= strtoupper(substr($clientUser['name'] ?: 'G', 0, 1)) ?></div>
+                <?php endif; ?>
+                <div class="user-meta-txt">
+                  <strong><?= h($clientUser['name'] ?: 'Akun Google') ?></strong>
+                  <span><?= h($clientUser['email']) ?></span>
+                </div>
+              </div>
+              <a href="index.php?action=logout_google" class="btn-logout-client">Ganti Akun</a>
+            </div>
+          <?php else: ?>
+            <a href="#" id="googleLoginBtn" class="btn-google-auth">
+              <svg viewBox="0 0 24 24">
+                <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.66-5.17 3.66-9.17z"/>
+                <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.34 24 12 24z"/>
+                <path fill="#FBBC05" d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.16 0 9.94 0 12s.45 3.84 1.25 5.42l4.03-3.15z"/>
+                <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.34 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"/>
+              </svg>
+              <span>Lanjutkan dengan Google</span>
+            </a>
+            <div class="or-divider">atau isi formulir manual</div>
+            <div class="notice-guest-rsvp">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+              <span>Jika tidak masuk dengan Google, Anda akan otomatis menerima email undangan kalender untuk melakukan <strong>Accept</strong> jadwal ini.</span>
+            </div>
+          <?php endif; ?>
+        </div>
+
         <form method="post" id="calBookingForm" novalidate>
           <input type="hidden" name="csrf" value="<?= h($_SESSION['booking_csrf']) ?>">
           <input type="hidden" name="service" id="formInputService" value="<?= h($selectedServiceName) ?>">
           <input type="hidden" name="date" id="formInputDate" value="<?= h($selectedDate) ?>">
-          <input type="hidden" name="time" id="formInputTime" value="">
+          <input type="hidden" name="time" id="formInputTime" value="<?= h($_GET['time'] ?? '') ?>">
 
           <div class="cal-field">
             <label class="cal-label" for="userName">Nama Lengkap <span class="req">*</span></label>
-            <input class="cal-input" id="userName" name="name" placeholder="John Doe" maxlength="100" autocomplete="name" required>
+            <input class="cal-input" id="userName" name="name" value="<?= h($clientUser['name'] ?? '') ?>" placeholder="Nama lengkap Anda" maxlength="100" autocomplete="name" required>
           </div>
 
           <div class="cal-field">
             <label class="cal-label" for="userEmail">Alamat Email <span class="req">*</span></label>
-            <input class="cal-input" id="userEmail" name="email" type="email" placeholder="john@example.com" maxlength="190" autocomplete="email" required>
+            <input class="cal-input" id="userEmail" name="email" type="email" value="<?= h($clientUser['email'] ?? '') ?>" placeholder="nama@email.com" maxlength="190" autocomplete="email" required>
           </div>
 
           <div class="cal-field">
@@ -938,7 +1284,7 @@ body {
   const maxDateObj = new Date(maxDateStr + "T00:00:00");
   
   let selectedDate = "<?= h($selectedDate) ?>";
-  let selectedTime = "";
+  let selectedTime = "<?= h($_GET['time'] ?? '') ?>";
   let viewDate = new Date(selectedDate + "T00:00:00");
   if (isNaN(viewDate.getTime())) {
     viewDate = new Date(todayDate);
@@ -963,6 +1309,7 @@ body {
   const inputService = document.getElementById('formInputService');
   const inputDate = document.getElementById('formInputDate');
   const inputTime = document.getElementById('formInputTime');
+  const googleLoginBtn = document.getElementById('googleLoginBtn');
 
   if (!gridEl) return;
 
@@ -1078,6 +1425,9 @@ body {
         const item = document.createElement('button');
         item.type = 'button';
         item.className = 'slot-item';
+        if (slotTime === selectedTime) {
+          item.classList.add('is-selected');
+        }
         item.textContent = slotTime;
         item.addEventListener('click', () => {
           selectedTime = slotTime;
@@ -1107,6 +1457,17 @@ body {
     datePane.style.display = 'flex';
     slotsPane.style.display = 'flex';
     gridEl.classList.remove('view-form');
+  }
+
+  // Google Login Button handler: sertakan current service, date, time
+  if (googleLoginBtn) {
+    googleLoginBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      const s = encodeURIComponent(serviceSelect.value);
+      const d = encodeURIComponent(selectedDate);
+      const t = encodeURIComponent(selectedTime || '');
+      location.href = `index.php?action=login_google&service=${s}&date=${d}&time=${t}`;
+    });
   }
 
   // Events
@@ -1150,6 +1511,12 @@ body {
   // Initial load
   renderCalendar();
   loadSlots();
+
+  // Jika URL mengindikasikan baru selesai login google dan sudah ada time, langsung buka form
+  const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.get('logged_in') === '1' && selectedTime) {
+    showFormView();
+  }
 
 })();
 </script>

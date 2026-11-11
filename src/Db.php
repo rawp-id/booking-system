@@ -9,6 +9,8 @@ namespace App;
 use PDO;
 use PDOException;
 use PDOStatement;
+use RuntimeException;
+use Throwable;
 
 class Db
 {

@@ -12,6 +12,8 @@ namespace App;
 use DateTimeImmutable;
 use DateTimeInterface;
 use DateTimeZone;
+use RuntimeException;
+use Throwable;
 
 class Calendar
 {
@@ -135,9 +137,13 @@ class Calendar
         return $cal['busy'] ?? [];
     }
 
-    public function createEvent(array $payload): array
+    public function createEvent(array $payload, array $queryParams = ['sendUpdates' => 'all']): array
     {
-        return $this->api('POST', 'https://www.googleapis.com/calendar/v3/calendars/' . rawurlencode((string)$this->cfg['calendar_id']) . '/events', $payload);
+        $url = 'https://www.googleapis.com/calendar/v3/calendars/' . rawurlencode((string)$this->cfg['calendar_id']) . '/events';
+        if (!empty($queryParams)) {
+            $url .= '?' . http_build_query($queryParams);
+        }
+        return $this->api('POST', $url, $payload);
     }
 
     public function deleteEvent(string $eventId): void
@@ -172,7 +178,7 @@ class Calendar
         return $token;
     }
 
-    private function api(string $method, string $url, ?array $payload = null): array
+    private function api(string $method, string $url, ?array $payload = null, bool $retryOn401 = true): array
     {
         $headers = [
             'Authorization: Bearer ' . $this->accessToken(),
@@ -180,6 +186,20 @@ class Calendar
         ];
         $r = httpRequest($method, $url, $headers, $payload === null ? null : json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
         $d = json_decode($r['body'], true) ?: [];
+
+        // Jika token tidak valid / revoked di server Google (HTTP 401), paksa refresh token sekali lagi
+        if ($r['status'] === 401 && $retryOn401) {
+            if (is_file($this->tokenFile)) {
+                $token = json_decode((string)file_get_contents($this->tokenFile), true) ?: [];
+                if (!empty($token['refresh_token'])) {
+                    $token['expires_at'] = 0; // force refresh
+                    $token = $this->refreshIfNeeded($token);
+                    $this->saveToken($token);
+                    return $this->api($method, $url, $payload, false);
+                }
+            }
+        }
+
         if ($r['status'] < 200 || $r['status'] >= 300) {
             throw new RuntimeException('Google Calendar API: ' . ($d['error']['message'] ?? ('HTTP ' . $r['status'])));
         }

@@ -9,6 +9,8 @@ namespace App;
 use DateTimeImmutable;
 use DateTimeZone;
 use DateTimeInterface;
+use RuntimeException;
+use Throwable;
 
 class Booking
 {
