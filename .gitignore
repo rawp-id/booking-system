@@ -1,0 +1,10 @@
+.env
+vendor/
+storage/*
+database/*.sqlite
+database/*.sqlite-journal
+*.php~
+.idea/
+.vscode/
+*.log
+.DS_Store

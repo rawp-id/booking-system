@@ -1,0 +1,15 @@
+# Blokir akses langsung ke folder sensitif dari browser
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^(config|src|database|storage|schema.sql|vendor)($|/) - [F,L]
+</IfModule>
+
+<IfModule !mod_rewrite.c>
+    # Fallback: coba blokir via RedirectMatch jika tersedia
+    <IfModule mod_alias.c>
+        RedirectMatch 403 ^/(config|src|database|storage|schema.sql|vendor)($|/)
+    </IfModule>
+</IfModule>
+
+# Default charset
+AddDefaultCharset utf-8
