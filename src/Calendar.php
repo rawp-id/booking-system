@@ -9,6 +9,10 @@ declare(strict_types=1);
 
 namespace App;
 
+use DateTimeImmutable;
+use DateTimeInterface;
+use DateTimeZone;
+
 class Calendar
 {
     private array $cfg;
